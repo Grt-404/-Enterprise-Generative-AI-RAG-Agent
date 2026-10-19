@@ -3,16 +3,11 @@
 End-to-end evaluation of the full RAG pipeline (retrieve -> rerank -> generate)
 with the RAG triad: contextual relevancy, faithfulness, answer relevancy.
 
-NO OPENAI: the judge is the same local open-source model the generator uses
-(see LocalJudge in evals/eval_generator.py), so nothing leaves your machine.
+Generator and judge both run through OpenRouter (see evals/eval_generator.py
+for the judge and the .env settings).
 
     python -m evals.eval_rag_pipeline
 """
-
-import os
-
-# local judging is slow: give each test case up to 20 minutes before DeepEval times out
-os.environ.setdefault("DEEPEVAL_PER_ATTEMPT_TIMEOUT_SECONDS_OVERRIDE", "1200")
 
 from dotenv import load_dotenv
 
@@ -26,7 +21,7 @@ from deepeval.metrics import (
 
 from src.rag_pipeline import RagPipeline
 from evals.harness import load_goldens, summarize_by_metric, print_summary
-from evals.eval_generator import JUDGE, EVAL_KWARGS   # local judge + sequential-run settings
+from evals.eval_generator import JUDGE, EVAL_KWARGS   # OpenRouter judge
 
 load_dotenv()
 
@@ -44,7 +39,7 @@ def run(rag):
     # 2. RUN THE INJECTED PIPELINE per query, build a test case from LIVE output
     test_cases = []
     for g in goldens:
-        out = rag.invoke(g["query"])          # retrieve -> rerank -> generate (local model)
+        out = rag.invoke(g["query"])          # retrieve -> rerank -> generate
 
         test_cases.append(
             LLMTestCase(
@@ -54,11 +49,11 @@ def run(rag):
             )
         )
 
-    # 3. THE THREE TRIAD METRICS (local judge, one case at a time)
+    # 3. THE THREE TRIAD METRICS
     metrics = [
-        ContextualRelevancyMetric(threshold=THRESHOLD, model=JUDGE, include_reason=True, async_mode=False),
-        FaithfulnessMetric(threshold=THRESHOLD, model=JUDGE, include_reason=True, async_mode=False),
-        AnswerRelevancyMetric(threshold=THRESHOLD, model=JUDGE, include_reason=True, async_mode=False),
+        ContextualRelevancyMetric(threshold=THRESHOLD, model=JUDGE, include_reason=True),
+        FaithfulnessMetric(threshold=THRESHOLD, model=JUDGE, include_reason=True),
+        AnswerRelevancyMetric(threshold=THRESHOLD, model=JUDGE, include_reason=True),
     ]
 
     # 4. EVALUATE

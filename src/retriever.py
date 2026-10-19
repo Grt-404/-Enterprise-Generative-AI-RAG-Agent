@@ -50,6 +50,14 @@ def load_store():
 
     docs = load_transcripts()
     chunks = RecursiveCharacterTextSplitter(
-        chunk_size=1000, chunk_overlap=150
+        chunk_size=768, chunk_overlap=150
     ).split_documents(docs)
     return Chroma.from_documents(chunks, embeddings, persist_directory=str(DB_DIR))
+if __name__ == "__main__":
+    store = load_store()
+    print("Chunks in store:", store._collection.count())
+
+    retriever = store.as_retriever(search_kwargs={"k": 5})
+    query = "what is regression testing?"
+    for r in retriever.invoke(query):
+        print(f"[Session {r.metadata['session']}] {r.page_content[:150]}...\n")

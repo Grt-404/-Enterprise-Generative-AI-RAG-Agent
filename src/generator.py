@@ -1,28 +1,53 @@
-import torch
-from threading import Thread
-from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
+"""
+src/generator.py — the GENERATOR component.
 
-# Qwen2.5-3B-Instruct: small, fast, no <think> text.
-# For DeepSeek, use "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B" (needs ~16 GB+ of GPU memory)
-MODEL_ID = "Qwen/Qwen2.5-1.5B-Instruct"
+Given a query and context (retrieved chunks), produce an answer grounded in
+the context. The prompt is faithfulness-first: answer ONLY from the context,
+and abstain when the context doesn't contain the answer.
 
-IS_R1 = "R1" in MODEL_ID                         # reasoning model -> thinks inside <think>...</think>
-MAX_NEW_TOKENS = 2048 if IS_R1 else 512
-GEN_KWARGS = (
-    dict(do_sample=True, temperature=0.6, top_p=0.95) if IS_R1            # DeepSeek's recommended sampling
-    else dict(do_sample=False, temperature=None, top_p=None, top_k=None)  # greedy, good for evals
+    from src.generator import generate
+    answer = generate("what is drift?", ["chunk text 1", "chunk text 2"])
+
+There are two entry points:
+  - generate(query, context)        -> returns the full answer string (default)
+  - generate_stream(query, context) -> yields the answer in chunks as it is
+                                       produced, for streaming UIs and for
+                                       measuring time-to-first-token (TTFT)
+Both share the exact same prompt, model, and chain — the only difference is
+that one waits for the whole answer and the other emits it token-by-token.
+
+Model: an open-source model served through OpenRouter (OpenAI-compatible API),
+so nothing runs on your machine. Settings in .env:
+
+    OPENROUTER_API_KEY=sk-or-...
+    GENERATOR_MODEL=meta-llama/llama-3.3-70b-instruct   # any model id from openrouter.ai/models
+
+Install:
+    pip install langchain-openai langchain-core python-dotenv
+"""
+
+import os
+
+from dotenv import load_dotenv
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_openai import ChatOpenAI
+
+load_dotenv()
+
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+MODEL_ID = os.getenv("GENERATOR_MODEL", "meta-llama/llama-3.3-70b-instruct")
+
+llm = ChatOpenAI(
+    model=MODEL_ID,
+    api_key=os.environ["OPENROUTER_API_KEY"],   # KeyError here = key missing from .env
+    base_url=OPENROUTER_BASE_URL,
+    temperature=0,
 )
 
-tok = AutoTokenizer.from_pretrained(MODEL_ID)
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL_ID,
-    dtype=torch.float16,      # T4 has no native bfloat16
-    device_map={"": 0},    # put the whole model on GPU 0 instead of staging it through CPU RAM        # splits across GPUs if needed
-)
-model.eval()
-print("loaded on:", model.hf_device_map if hasattr(model, "hf_device_map") else model.device)
-
-PROMPT = """
+# faithfulness-first prompt: ground every claim in the context, abstain if unsure
+prompt = ChatPromptTemplate.from_template(
+    """
 You are a helpful teaching assistant for a course on LLM evaluations. Answer the student's question using ONLY the information in the context provided below.
 
 Rules:
@@ -77,76 +102,58 @@ Rules:
 
 Answer:
 """
+)
+
+
+chain = prompt | llm | StrOutputParser()
 
 THINK_END = "</think>"
 
 
 def _strip_think(text: str) -> str:
-    """Drop the model's reasoning (only matters for DeepSeek-R1)."""
+    """Drop reasoning text if you pick a reasoning model (e.g. a DeepSeek-R1 variant)."""
     if THINK_END in text:
         text = text.rsplit(THINK_END, 1)[1]
     return text.strip()
 
 
-def _build_inputs(query: str, context: list[str]):
-    head, tail = PROMPT.split("{context}")          # fill the slots without them contaminating each other
-    tail = tail.replace("{question}", query)
-    text = head + "\n\n".join(context) + tail
-    chat = tok.apply_chat_template(
-        [{"role": "user", "content": text}], tokenize=False, add_generation_prompt=True
-    )
-    return tok(chat, return_tensors="pt", add_special_tokens=False).to(model.device)
-
-
 def generate(query: str, context: list[str]) -> str:
     """Generate a grounded answer from the query and context chunks."""
-    inputs = _build_inputs(query, context)
-    with torch.no_grad():
-        out = model.generate(**inputs, max_new_tokens=MAX_NEW_TOKENS, **GEN_KWARGS)
-    answer = tok.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
-    return _strip_think(answer)
+    context_text = "\n\n".join(context)
+    return _strip_think(chain.invoke({"question": query, "context": context_text}))
 
 
 def generate_stream(query: str, context: list[str]):
-    """Yield the answer piece by piece (reasoning is held back for R1)."""
-    inputs = _build_inputs(query, context)
-    streamer = TextIteratorStreamer(tok, skip_prompt=True, skip_special_tokens=True)
-    kwargs = dict(**inputs, streamer=streamer, max_new_tokens=MAX_NEW_TOKENS, **GEN_KWARGS)
-    Thread(target=model.generate, kwargs=kwargs, daemon=True).start()
+    """
+    Stream the grounded answer chunk-by-chunk as it is generated.
 
-    if not IS_R1:
-        for piece in streamer:
-            if piece:
-                yield piece
-        return
+    Same prompt / model / chain as generate() — we just call .stream() instead
+    of .invoke(). Because the chain ends in StrOutputParser(), each yielded
+    chunk is already a plain str, so no .content unpacking is needed.
 
-    buffer, answering = "", False                   # R1: wait for </think>, then stream the answer
-    for piece in streamer:
-        if not piece:
-            continue
-        if answering:
-            yield piece
-            continue
-        buffer += piece
-        if THINK_END in buffer:
-            answering = True
-            rest = buffer.split(THINK_END, 1)[1].lstrip()
-            if rest:
-                yield rest
-
-    if not answering and buffer.strip():
-        yield buffer.strip()
+    Yields:
+        str: successive pieces of the answer. Empty chunks are skipped so the
+             caller can clock time-to-first-token on the first *visible* token.
+    """
+    context_text = "\n\n".join(context)
+    for chunk in chain.stream({"question": query, "context": context_text}):
+        if chunk:                      # skip empty leading chunks
+            yield chunk
 
 
+# quick manual test: python src/generator.py
 if __name__ == "__main__":
-    ctx = ["Online eval means evaluating your system on live production traffic "
-           "after deployment. It works without an answer key, unlike offline eval."]
+    ctx = [
+        "Online eval means evaluating your system on live production traffic "
+        "after deployment. It works without an answer key, unlike offline eval."
+    ]
 
     print(generate("what is online eval?", ctx))
 
     print("\n--- streaming ---")
     for piece in generate_stream("what is online eval?", ctx):
         print(piece, end="", flush=True)
+    print()
 
-    print("\n\n--- abstain test ---")
+    print("\n--- abstain test ---")
     print(generate("who won the world cup in 2018?", ctx))
