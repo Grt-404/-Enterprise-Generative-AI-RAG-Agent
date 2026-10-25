@@ -43,6 +43,8 @@ llm = ChatOpenAI(
     api_key=os.environ["OPENROUTER_API_KEY"],   # KeyError here = key missing from .env
     base_url=OPENROUTER_BASE_URL,
     temperature=0,
+    max_retries=int(os.getenv("LLM_MAX_RETRIES", "2")),   # the reliability eval sets this to 0 to expose hidden retries
+    max_tokens=1500,      # caps the credit OpenRouter reserves per request (answers are far shorter)
 )
 
 # faithfulness-first prompt: ground every claim in the context, abstain if unsure
